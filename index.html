@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Invoice Scanner & Emailer</title>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- PDF.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        body {
+            background-color: #f3f4f6;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .drop-zone {
+            transition: all 0.3s ease;
+        }
+        .drop-zone:hover, .drop-zone.drag-active {
+            border-color: #3b82f6;
+            background-color: #eff6ff;
+        }
+        .animate-in {
+            animation: fadeIn 0.5s ease-out forwards;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+        
+        // --- Components ---
+
+        const Icon = ({ name, size = 24, className = "" }) => {
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons();
+            }, [name]);
+            return <i data-lucide={name} width={size} height={size} className={className}></i>;
+        };
+
+        const App = () => {
+            const [step, setStep] = useState('upload'); // upload, vendor, review
+            const [file, setFile] = useState(null);
+            const [extractedData, setExtractedData] = useState({});
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [error, setError] = useState(null);
+            
+            // Persist user name
+            const [username, setUsername] = useState(() => {
+                return localStorage.getItem('invoice_scanner_username') || '';
+            });
+
+            useEffect(() => {
+                localStorage.setItem('invoice_scanner_username', username);
+            }, [username]);
+            
+            // Vendors Configuration
+            const vendors = [
+                { id: 'boise', name: 'Boise Cascade', logo: 'tree-pine' },
+                { id: 'other', name: 'Other Vendor (Coming Soon)', logo: 'building-2', disabled: true }
+            ];
+
+            const handleFileDrop = (e) => {
+                e.preventDefault();
+                const droppedFile = e.dataTransfer.files[0];
+                if (droppedFile && droppedFile.type === 'application/pdf') {
+                    setFile(droppedFile);
+                    setStep('vendor');
+                    setError(null);
+                } else {
+                    setError("Please upload a valid PDF file.");
+                }
+            };
+
+            const handleFileSelect = (e) => {
+                const selectedFile = e.target.files[0];
+                if (selectedFile && selectedFile.type === 'application/pdf') {
+                    setFile(selectedFile);
+                    setStep('vendor');
+                    setError(null);
+                }
+            };
+
+            const processFile = async (vendorId) => {
+                setIsProcessing(true);
+                try {
+                    const textContent = await extractTextFromPDF(file);
+                    const data = parseInvoiceData(textContent, vendorId);
+                    setExtractedData(data);
+                    setStep('review');
+                } catch (err) {
+                    console.error(err);
+                    setError("Failed to read the PDF. Please ensure it is a valid text-based PDF.");
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            const extractTextFromPDF = async (file) => {
+                const arrayBuffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+                let fullText = '';
+                
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    const page = await pdf.getPage(i);
+                    const textContent = await page.getTextContent();
+                    const pageText = textContent.items.map(item => item.str).join(' ');
+                    fullText += pageText + '\n';
+                }
+                return fullText;
+            };
+
+            const parseInvoiceData = (text, vendorId) => {
+                let data = {
+                    vendor: 'Boise Cascade',
+                    invoiceNumber: '',
+                    date: '',
+                    poNumber: '',
+                    jobName: '',
+                    total: ''
+                };
+
+                if (vendorId === 'boise') {
+                    // Optimized regex based on uploaded file structure
+                    const invMatch = text.match(/HS\d{10}-\d{3}|HS\d+-\d+/);
+                    if (invMatch) data.invoiceNumber = invMatch[0];
+
+                    const dateMatch = text.match(/Invoice Date:\s*"?(\d{2}\/\d{2}\/\d{2})"?/i) || text.match(/(\d{2}\/\d{2}\/\d{2})/);
+                    if (dateMatch) data.date = dateMatch[1];
+
+                    const poMatch = text.match(/PO:\s*(\d+)/i);
+                    if (poMatch) data.poNumber = poMatch[1];
+
+                    const jobMatch = text.match(/JOB:\s*(.*?)(?=\s*(SHIP VIA|Page|REF|$))/i);
+                    if (jobMatch) data.jobName = jobMatch[1].trim();
+
+                    const balanceMatch = text.match(/Balance\s*"?\$([\d,]+\.\d{2})"?/i);
+                    if (balanceMatch) data.total = balanceMatch[1];
+                }
+
+                return data;
+            };
+
+            const resetApp = () => {
+                setStep('upload');
+                setFile(null);
+                setExtractedData({});
+                setError(null);
+            };
+
+            return (
+                <div className="min-h-screen flex flex-col items-center justify-center p-6">
+                    <div className="w-full max-w-2xl bg-white rounded-xl shadow-xl overflow-hidden">
+                        
+                        {/* Header */}
+                        <div className="bg-slate-800 p-6 flex items-center justify-between text-white">
+                            <div className="flex items-center gap-3">
+                                <Icon name="file-scan" className="text-blue-400" />
+                                <div>
+                                    <h1 className="text-xl font-bold">Invoice Scanner</h1>
+                                    <p className="text-xs text-slate-400">Automated Extraction Tool</p>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-4">
+                                {step !== 'upload' && (
+                                    <button onClick={resetApp} className="text-sm text-slate-300 hover:text-white flex items-center gap-1">
+                                        <Icon name="rotate-ccw" size={16} /> Start Over
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Content Area */}
+                        <div className="p-8 min-h-[400px] flex flex-col">
+                            
+                            {error && (
+                                <div className="mb-6 p-4 bg-red-50 border-l-4 border-red-500 text-red-700 flex items-center gap-3">
+                                    <Icon name="alert-circle" />
+                                    <p>{error}</p>
+                                </div>
+                            )}
+
+                            {/* STEP 1: UPLOAD */}
+                            {step === 'upload' && (
+                                <div className="flex-1 flex flex-col">
+                                    <div className="mb-6 flex justify-end">
+                                        <div className="flex items-center gap-2 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200">
+                                            <Icon name="user" size={16} className="text-slate-500" />
+                                            <input 
+                                                type="text" 
+                                                placeholder="Your Name (for tagging)" 
+                                                value={username}
+                                                onChange={(e) => setUsername(e.target.value)}
+                                                className="bg-transparent border-none text-sm text-slate-700 placeholder-slate-400 focus:outline-none w-40"
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <div 
+                                        className="flex-1 border-4 border-dashed border-slate-200 rounded-xl flex flex-col items-center justify-center p-10 drop-zone cursor-pointer"
+                                        onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('drag-active'); }}
+                                        onDragLeave={(e) => { e.currentTarget.classList.remove('drag-active'); }}
+                                        onDrop={handleFileDrop}
+                                        onClick={() => document.getElementById('fileInput').click()}
+                                    >
+                                        <input 
+                                            type="file" 
+                                            id="fileInput" 
+                                            className="hidden" 
+                                            accept=".pdf" 
+                                            onChange={handleFileSelect} 
+                                        />
+                                        <div className="bg-blue-100 p-6 rounded-full mb-6">
+                                            <Icon name="upload-cloud" size={48} className="text-blue-600" />
+                                        </div>
+                                        <h2 className="text-2xl font-bold text-slate-700 mb-2">Drop your invoice here</h2>
+                                        <p className="text-slate-500 mb-6">or click to browse files</p>
+                                        <span className="text-xs text-slate-400 bg-slate-100 px-3 py-1 rounded-full">Supports PDF Files</span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* STEP 2: VENDOR SELECTION */}
+                            {step === 'vendor' && (
+                                <div className="flex-1 flex flex-col items-center animate-in">
+                                    <h2 className="text-2xl font-bold text-slate-800 mb-2">Select Vendor</h2>
+                                    <p className="text-slate-500 mb-8">Which vendor is this invoice from?</p>
+                                    
+                                    <div className="grid grid-cols-1 gap-4 w-full max-w-md">
+                                        {vendors.map(v => (
+                                            <button
+                                                key={v.id}
+                                                disabled={v.disabled}
+                                                onClick={() => processFile(v.id)}
+                                                className={`
+                                                    flex items-center gap-4 p-4 rounded-lg border-2 text-left transition-all
+                                                    ${v.disabled 
+                                                        ? 'bg-gray-50 border-gray-100 text-gray-400 cursor-not-allowed' 
+                                                        : 'bg-white border-slate-200 hover:border-blue-500 hover:shadow-md text-slate-700'}
+                                                `}
+                                            >
+                                                <div className={`p-3 rounded-full ${v.disabled ? 'bg-gray-200' : 'bg-blue-50 text-blue-600'}`}>
+                                                    <Icon name={v.logo} />
+                                                </div>
+                                                <div className="flex-1">
+                                                    <div className="font-bold">{v.name}</div>
+                                                    {v.disabled && <div className="text-xs">Processing not available yet</div>}
+                                                </div>
+                                                {!v.disabled && <Icon name="chevron-right" className="text-slate-300" />}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    
+                                    {isProcessing && (
+                                        <div className="mt-8 flex items-center gap-2 text-blue-600">
+                                            <Icon name="loader-2" className="animate-spin" />
+                                            <span>Scanning document...</span>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* STEP 3: REVIEW & EMAIL */}
+                            {step === 'review' && (
+                                <ReviewStep 
+                                    data={extractedData} 
+                                    setData={setExtractedData}
+                                    file={file}
+                                    username={username}
+                                    setUsername={setUsername}
+                                />
+                            )}
+
+                        </div>
+                    </div>
+                    <div className="mt-6 text-slate-400 text-sm">
+                        Invoice Processor v1.5 • Secure Local Processing
+                    </div>
+                </div>
+            );
+        };
+
+        const ReviewStep = ({ data, setData, file, username, setUsername }) => {
+            const [copied, setCopied] = useState(false);
+            const [renamedFileUrl, setRenamedFileUrl] = useState(null);
+            const [renamedFileName, setRenamedFileName] = useState('');
+
+            useEffect(() => {
+                if (file) {
+                    // Update filename whenever data changes
+                    const inv = data.invoiceNumber ? data.invoiceNumber : 'INV';
+                    const newName = `${data.vendor.replace(/\s+/g, '')}_${inv}.pdf`;
+                    setRenamedFileName(newName);
+                    
+                    const url = URL.createObjectURL(file);
+                    setRenamedFileUrl(url);
+                    return () => URL.revokeObjectURL(url);
+                }
+            }, [file, data.invoiceNumber, data.vendor]);
+
+            const handleChange = (field, value) => {
+                setData(prev => ({ ...prev, [field]: value }));
+            };
+
+            const emailSubject = `Invoice Submission - ${data.vendor} - ${data.invoiceNumber}`;
+            const emailBody = `
+Hello,
+
+Please file the attached invoice.
+
+Details:
+--------------------------------
+Uploaded By: ${username || 'N/A'}
+Vendor: ${data.vendor}
+Invoice #: ${data.invoiceNumber}
+Date: ${data.date}
+PO Number: ${data.poNumber}
+Job Name: ${data.jobName}
+Total Amount: $${data.total}
+--------------------------------
+
+Attached File: ${renamedFileName}
+
+Thank you.
+            `.trim();
+
+            const mailtoLink = `mailto:?subject=${encodeURIComponent(emailSubject)}&body=${encodeURIComponent(emailBody)}`;
+
+            // The Magic "One Click" Function
+            const handleSmartAction = (e) => {
+                // 1. Trigger Download
+                const link = document.createElement('a');
+                link.href = renamedFileUrl;
+                link.download = renamedFileName;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+
+                // 2. The link's href (mailto) will handle opening the email client automatically
+            };
+
+            const copyToClipboard = () => {
+                const textToCopy = `Uploaded By: ${username}\nVendor: ${data.vendor}\nInvoice: ${data.invoiceNumber}\nDate: ${data.date}\nPO: ${data.poNumber}\nJob: ${data.jobName}\nTotal: $${data.total}`;
+                navigator.clipboard.writeText(textToCopy);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+            };
+
+            return (
+                <div className="flex-1 w-full animate-in">
+                    
+                    {/* Header */}
+                    <div className="flex flex-col md:flex-row justify-between items-start md:items-end mb-6 gap-4 border-b pb-4">
+                        <div>
+                            <h2 className="text-2xl font-bold text-slate-800">Verify & Process</h2>
+                            <p className="text-slate-500 text-sm">Check details below, then click the blue button.</p>
+                        </div>
+                        <div className="flex items-center gap-2 bg-slate-50 px-3 py-1 rounded border border-slate-200">
+                            <Icon name="user-circle" size={16} className="text-slate-400" />
+                            <input 
+                                type="text"
+                                value={username}
+                                onChange={(e) => setUsername(e.target.value)}
+                                placeholder="Enter your name"
+                                className="bg-transparent border-none text-sm text-slate-700 outline-none w-32 text-right"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4 mb-8">
+                        {/* Important fields highlighted */}
+                        <div className="col-span-2 md:col-span-1">
+                            <label className="block text-xs font-bold text-blue-600 uppercase mb-1">Invoice Number (Renames File)</label>
+                            <div className="relative">
+                                <input 
+                                    type="text" 
+                                    value={data.invoiceNumber} 
+                                    onChange={(e) => handleChange('invoiceNumber', e.target.value)}
+                                    className={`w-full p-2 border rounded focus:ring-2 outline-none font-mono font-bold ${!data.invoiceNumber ? 'border-red-300 bg-red-50 focus:ring-red-500' : 'border-blue-200 focus:ring-blue-500'}`}
+                                    placeholder="REQUIRED"
+                                />
+                                {!data.invoiceNumber && <span className="absolute right-2 top-2 text-red-500 text-xs font-bold">Required</span>}
+                            </div>
+                        </div>
+                         <div className="col-span-2 md:col-span-1">
+                            <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Vendor</label>
+                            <input 
+                                type="text" 
+                                value={data.vendor} 
+                                onChange={(e) => handleChange('vendor', e.target.value)}
+                                className="w-full p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                            />
+                        </div>
+                        <div className="col-span-2 md:col-span-1">
+                            <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Invoice Date</label>
+                            <input 
+                                type="text" 
+                                value={data.date} 
+                                onChange={(e) => handleChange('date', e.target.value)}
+                                className="w-full p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                            />
+                        </div>
+                        <div className="col-span-2 md:col-span-1">
+                            <label className="block text-xs font-bold text-slate-500 uppercase mb-1">PO Number</label>
+                            <input 
+                                type="text" 
+                                value={data.poNumber} 
+                                onChange={(e) => handleChange('poNumber', e.target.value)}
+                                className="w-full p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                            />
+                        </div>
+                         <div className="col-span-2 md:col-span-1">
+                            <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Job Name</label>
+                            <input 
+                                type="text" 
+                                value={data.jobName} 
+                                onChange={(e) => handleChange('jobName', e.target.value)}
+                                className="w-full p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                            />
+                        </div>
+                        <div className="col-span-2 md:col-span-1">
+                            <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Total Balance</label>
+                            <div className="relative">
+                                <span className="absolute left-3 top-2 text-slate-500">$</span>
+                                <input 
+                                    type="text" 
+                                    value={data.total} 
+                                    onChange={(e) => handleChange('total', e.target.value)}
+                                    className="w-full p-2 pl-6 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none font-bold text-slate-700"
+                                />
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="flex flex-col gap-4">
+                        {/* BIG UNIFIED ACTION BUTTON */}
+                        <a 
+                            href={mailtoLink}
+                            onClick={handleSmartAction}
+                            className="w-full py-4 px-6 bg-blue-600 hover:bg-blue-700 text-white rounded-xl shadow-lg hover:shadow-xl transition-all flex items-center justify-center gap-4 group cursor-pointer"
+                        >
+                            <div className="bg-blue-500 p-2 rounded-lg group-hover:bg-blue-600 transition-colors">
+                                <Icon name="download" size={24} className="text-white" />
+                            </div>
+                            <div className="text-left">
+                                <div className="font-bold text-lg leading-none">Save Invoice & Open Email</div>
+                                <div className="text-xs text-blue-200 mt-1">Downloads {renamedFileName} + Drafts Email</div>
+                            </div>
+                            <Icon name="arrow-right" className="ml-auto opacity-50 group-hover:opacity-100 group-hover:translate-x-1 transition-all" />
+                        </a>
+
+                        <div className="flex items-center justify-center gap-2 text-xs text-slate-400">
+                             <Icon name="info" size={14} />
+                             <span>Don't forget to drag the downloaded file into the email window!</span>
+                        </div>
+                        
+                        <button 
+                            onClick={copyToClipboard}
+                            className="text-slate-400 hover:text-slate-600 text-sm flex items-center justify-center gap-2 mt-2"
+                        >
+                            {copied ? <Icon name="check" size={14} /> : <Icon name="copy" size={14} />}
+                            {copied ? "Copied to clipboard" : "Or just copy text to clipboard"}
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
