@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Invoice Scanner Pro</title>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- PDF.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        body { background-color: #f1f5f9; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; height: 100vh; overflow: hidden; }
+        .drop-zone { transition: all 0.2s ease; border-width: 2px; }
+        .drop-zone:hover, .drop-zone.drag-active { border-color: #3b82f6; background-color: #eff6ff; }
+        .animate-in { animation: fadeIn 0.3s ease-out forwards; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        
+        /* PC Scrollbar Styles */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        // --- Logic Engine ---
+
+        const calculateTerms = (dateStr, totalStr) => {
+            const res = { netTotal: '', discountAmount: '', discountTotal: '', discountDate: '', netDate: '', accumPeriod: '' };
+            if (!dateStr || !totalStr) return res;
+
+            try {
+                const totalNum = parseFloat(totalStr.replace(/[^0-9.]/g, ''));
+                if (isNaN(totalNum)) return res;
+
+                res.netTotal = "$" + totalNum.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                const discountVal = totalNum * 0.01;
+                res.discountAmount = "$" + discountVal.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                res.discountTotal = "$" + (totalNum - discountVal).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+                const [m, d, y] = dateStr.split('/').map(n => parseInt(n));
+                const fullYear = y < 100 ? 2000 + y : y;
+                
+                let payMonth = m;
+                let payYear = fullYear;
+
+                // Prox 10th Logic
+                if (d > 10) {
+                    payMonth++;
+                    if (payMonth > 12) { payMonth = 1; payYear++; }
+                }
+
+                res.discountDate = new Date(payYear, payMonth - 1, 20).toLocaleDateString();
+                res.netDate = new Date(payYear, payMonth - 1, 21).toLocaleDateString();
+
+                let startMonth = payMonth - 1;
+                let startYear = payYear;
+                if (startMonth < 1) { startMonth = 12; startYear--; }
+                
+                const sDate = new Date(startYear, startMonth - 1, 11).toLocaleDateString();
+                const eDate = new Date(payYear, payMonth - 1, 10).toLocaleDateString();
+                res.accumPeriod = `${sDate} - ${eDate}`;
+
+            } catch (e) { console.error("Math error", e); }
+            return res;
+        };
+
+        const extractData = (text, vendorId) => {
+            let data = {
+                vendor: 'Boise Cascade', invoiceNumber: '', date: '', poNumber: '',
+                jobName: '', total: '', paymentTerms: '', orderDate: '', shipDate: ''
+            };
+
+            if (vendorId === 'boise') {
+                const match = (regex, idx=1) => (text.match(regex) || [])[idx] || '';
+                
+                data.invoiceNumber = match(/HS\d{10}-\d{3}|HS\d+-\d+/, 0);
+                data.date = match(/Invoice Date:[\s\S]*?(\d{2}\/\d{2}\/\d{2})/i) || match(/(\d{2}\/\d{2}\/\d{2})/, 1);
+                data.poNumber = match(/PO:\s*(\d+)/i);
+                data.orderDate = match(/ORDER DATE:\s*(\d{2}\/\d{2}\/\d{2})/i);
+                data.shipDate = match(/SHIP DATE:\s*(\d{2}\/\d{2}\/\d{2})/i);
+                data.jobName = match(/JOB:\s*(.*?)(?=\s*(SHIP VIA|Page|REF|$))/i).trim();
+                data.total = match(/Balance\s*"?\$([\d,]+\.\d{2})"?/i);
+                data.paymentTerms = match(/PAYMENT TERMS:\s*([\s\S]*?)(?=\s*(EMAILED|You may deduct|$))/i).replace(/\n/g, ' ').trim();
+            }
+            return data;
+        };
+
+        // --- UI Components ---
+
+        const Icon = ({ name, size = 18, className = "" }) => {
+            useEffect(() => { if (window.lucide) window.lucide.createIcons(); }, [name]);
+            return <i data-lucide={name} width={size} height={size} className={className}></i>;
+        };
+
+        // Renders the PDF page to a canvas for sidebar preview
+        const PdfPreview = ({ file }) => {
+            const canvasRef = useRef(null);
+            
+            useEffect(() => {
+                if (!file || !canvasRef.current) return;
+                
+                const renderPage = async () => {
+                    const buffer = await file.arrayBuffer();
+                    const pdf = await pdfjsLib.getDocument(buffer).promise;
+                    const page = await pdf.getPage(1);
+                    
+                    const viewport = page.getViewport({ scale: 1.5 });
+                    const canvas = canvasRef.current;
+                    const context = canvas.getContext('2d');
+                    
+                    // Scale to container width
+                    const containerWidth = canvas.parentElement.clientWidth;
+                    const scale = (containerWidth - 32) / viewport.width; 
+                    const scaledViewport = page.getViewport({ scale: scale > 0 ? scale : 1 });
+
+                    canvas.height = scaledViewport.height;
+                    canvas.width = scaledViewport.width;
+
+                    await page.render({ canvasContext: context, viewport: scaledViewport }).promise;
+                };
+                renderPage();
+            }, [file]);
+
+            return (
+                <div className="bg-slate-200 rounded-lg overflow-auto h-full flex justify-center p-4 border border-slate-300 shadow-inner">
+                    <canvas ref={canvasRef} className="shadow-lg max-w-full" />
+                </div>
+            );
+        };
+
+        const InputRow = ({ label, value, onChange, width="full", required=false, icon=null }) => (
+            <div className={`flex flex-col ${width === 'half' ? 'col-span-1' : 'col-span-2'}`}>
+                <label className="text-[10px] font-bold text-slate-500 uppercase mb-1 flex items-center gap-1">
+                    {icon && <Icon name={icon} size={10} />}
+                    {label}
+                    {required && <span className="text-red-500">*</span>}
+                </label>
+                <input 
+                    type="text" 
+                    value={value || ''} 
+                    onChange={e => onChange(e.target.value)}
+                    className={`px-2 py-1.5 text-sm border rounded focus:ring-2 outline-none transition-colors
+                        ${required && !value ? 'border-red-300 bg-red-50 focus:ring-red-500' : 'border-slate-300 focus:border-blue-500 focus:ring-blue-100'}
+                    `}
+                />
+            </div>
+        );
+
+        // --- Main Application ---
+
+        const App = () => {
+            const [step, setStep] = useState('upload'); 
+            const [file, setFile] = useState(null);
+            const [extractedData, setExtractedData] = useState({});
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [username, setUsername] = useState(() => localStorage.getItem('inv_scan_user') || '');
+
+            useEffect(() => localStorage.setItem('inv_scan_user', username), [username]);
+
+            const handleFile = async (inputFile) => {
+                if (inputFile?.type === 'application/pdf') {
+                    setFile(inputFile);
+                    setStep('vendor');
+                } else {
+                    alert("Please upload a PDF.");
+                }
+            };
+
+            const runScan = async () => {
+                setIsProcessing(true);
+                try {
+                    const buffer = await file.arrayBuffer();
+                    const pdf = await pdfjsLib.getDocument(buffer).promise;
+                    let fullText = '';
+                    for (let i = 1; i <= pdf.numPages; i++) {
+                        const page = await pdf.getPage(i);
+                        const txt = await page.getTextContent();
+                        fullText += txt.items.map(s => s.str).join(' ') + '\n';
+                    }
+                    setExtractedData(extractData(fullText, 'boise'));
+                    setStep('review');
+                } catch (e) { console.error(e); alert("Error reading PDF"); }
+                setIsProcessing(false);
+            };
+
+            return (
+                <div className="h-screen flex flex-col bg-slate-100">
+                    {/* PC Header */}
+                    <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between shadow-sm z-10">
+                        <div className="flex items-center gap-3">
+                            <div className="bg-blue-600 p-1.5 rounded text-white"><Icon name="file-scan" /></div>
+                            <h1 className="font-bold text-slate-700">Invoice Scanner Pro</h1>
+                        </div>
+                        <div className="flex items-center gap-4">
+                            <div className="flex items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-full border border-slate-200">
+                                <Icon name="user-circle" className="text-slate-400" />
+                                <input 
+                                    className="bg-transparent border-none text-xs text-slate-600 outline-none w-24"
+                                    placeholder="Your Name"
+                                    value={username}
+                                    onChange={e => setUsername(e.target.value)}
+                                />
+                            </div>
+                            {step !== 'upload' && (
+                                <button onClick={() => { setFile(null); setStep('upload'); }} className="text-xs font-medium text-slate-500 hover:text-slate-800 flex items-center gap-1">
+                                    <Icon name="rotate-ccw" size={14} /> New Scan
+                                </button>
+                            )}
+                        </div>
+                    </header>
+
+                    {/* Main Content Area */}
+                    <main className="flex-1 overflow-hidden relative">
+                        {step === 'upload' && (
+                            <div className="h-full flex flex-col items-center justify-center p-8 animate-in">
+                                <div 
+                                    className="w-full max-w-xl h-64 border-2 border-dashed border-slate-300 rounded-2xl bg-white flex flex-col items-center justify-center cursor-pointer hover:border-blue-500 hover:bg-blue-50 transition-all shadow-sm"
+                                    onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = '#3b82f6'; }}
+                                    onDragLeave={e => { e.currentTarget.style.borderColor = '#cbd5e1'; }}
+                                    onDrop={e => { e.preventDefault(); handleFile(e.dataTransfer.files[0]); }}
+                                    onClick={() => document.getElementById('fi').click()}
+                                >
+                                    <input type="file" id="fi" className="hidden" accept=".pdf" onChange={e => handleFile(e.target.files[0])} />
+                                    <div className="p-4 bg-blue-100 text-blue-600 rounded-full mb-4"><Icon name="upload" size={32} /></div>
+                                    <h2 className="text-xl font-semibold text-slate-700">Drag & Drop Invoice PDF</h2>
+                                    <p className="text-slate-400 mt-2 text-sm">or click to browse</p>
+                                </div>
+                            </div>
+                        )}
+
+                        {step === 'vendor' && (
+                            <div className="h-full flex flex-col items-center justify-center animate-in">
+                                <h2 className="text-2xl font-bold text-slate-800 mb-6">Select Vendor</h2>
+                                <button onClick={runScan} className="w-80 group p-5 bg-white border border-slate-200 rounded-xl shadow-sm hover:shadow-md hover:border-blue-500 transition-all flex items-center gap-4 text-left">
+                                    <div className="p-3 bg-green-50 text-green-600 rounded-lg group-hover:scale-110 transition-transform"><Icon name="tree-pine" /></div>
+                                    <div>
+                                        <div className="font-bold text-slate-700">Boise Cascade</div>
+                                        <div className="text-xs text-slate-400">Auto-detect logic active</div>
+                                    </div>
+                                    <Icon name="arrow-right" className="ml-auto text-slate-300 group-hover:text-blue-500" />
+                                </button>
+                                {isProcessing && <div className="mt-8 text-blue-600 flex items-center gap-2"><Icon name="loader-2" className="animate-spin" /> Scanning...</div>}
+                            </div>
+                        )}
+
+                        {step === 'review' && (
+                            <ReviewSplitView 
+                                file={file} 
+                                initialData={extractedData} 
+                                username={username}
+                            />
+                        )}
+                    </main>
+                </div>
+            );
+        };
+
+        const ReviewSplitView = ({ file, initialData, username }) => {
+            const [data, setData] = useState(initialData);
+            const [calc, setCalc] = useState({});
+            const [fileName, setFileName] = useState('');
+            const [fileUrl, setFileUrl] = useState('');
+
+            // Recalculate logic when fields change
+            useEffect(() => {
+                setCalc(calculateTerms(data.date, data.total));
+            }, [data.date, data.total]);
+
+            // Update filename logic
+            useEffect(() => {
+                if (file) {
+                    const inv = data.invoiceNumber || 'INV';
+                    const name = `${data.vendor.replace(/\s/g,'')}_${inv}.pdf`;
+                    setFileName(name);
+                    const url = URL.createObjectURL(file);
+                    setFileUrl(url);
+                    return () => URL.revokeObjectURL(url);
+                }
+            }, [file, data.invoiceNumber]);
+
+            const update = (f, v) => setData(p => ({...p, [f]: v}));
+
+            const handleDownloadAndMail = () => {
+                // Trigger DL
+                const a = document.createElement('a');
+                a.href = fileUrl;
+                a.download = fileName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                
+                // Construct Mailto with safe line breaks
+                const body = [
+                    "Hello,", "",
+                    "Please file the attached invoice.", "",
+                    "Details:",
+                    "--------------------------------",
+                    `Uploaded By: ${username || 'N/A'}`,
+                    `Vendor: ${data.vendor}`,
+                    `Invoice #: ${data.invoiceNumber}`,
+                    `Job Name: ${data.jobName}`,
+                    "",
+                    "Key Dates:",
+                    `Invoice Date: ${data.date}`,
+                    `Order Date: ${data.orderDate}`,
+                    `Ship Date: ${data.shipDate}`,
+                    "",
+                    "Payment Calculation:",
+                    `Accumulation: ${calc.accumPeriod}`,
+                    "",
+                    "OPTION 1: EARLY PAY (Save 1%)",
+                    `Due: ${calc.discountDate} | Pay: ${calc.discountTotal} (Save ${calc.discountAmount})`,
+                    "",
+                    "OPTION 2: STANDARD",
+                    `Due: ${calc.netDate} | Pay: ${calc.netTotal}`,
+                    "--------------------------------", "",
+                    `Attached: ${fileName}`, "",
+                    "Thank you."
+                ].join('%0D%0A');
+
+                window.location.href = `mailto:?subject=${encodeURIComponent(`Invoice - ${data.vendor} - ${data.invoiceNumber}`)}&body=${body}`;
+            };
+
+            return (
+                <div className="h-full flex animate-in">
+                    {/* LEFT PANEL: PDF VIEWER */}
+                    <div className="w-1/2 p-4 h-full border-r border-slate-200 bg-slate-100 hidden lg:block">
+                        <div className="h-full flex flex-col">
+                            <div className="flex justify-between items-center mb-2 px-1">
+                                <span className="text-xs font-bold text-slate-500 uppercase">Original Document</span>
+                                <span className="text-xs text-slate-400">{file?.name}</span>
+                            </div>
+                            <div className="flex-1 overflow-hidden relative">
+                                <PdfPreview file={file} />
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* RIGHT PANEL: DATA FORM */}
+                    <div className="w-full lg:w-1/2 h-full flex flex-col bg-white">
+                        <div className="flex-1 overflow-y-auto p-6 lg:p-8">
+                            
+                            {/* Calculation Summary Card */}
+                            <div className="mb-6 bg-slate-50 border border-slate-200 rounded-lg p-4 grid grid-cols-3 gap-4">
+                                <div className="text-center">
+                                    <div className="text-[10px] font-bold text-slate-400 uppercase">Accumulation</div>
+                                    <div className="text-xs font-bold text-slate-700 mt-1">{calc.accumPeriod || '-'}</div>
+                                </div>
+                                <div className="text-center border-l border-r border-slate-200 px-2 bg-green-50/50 -my-4 py-4">
+                                    <div className="text-[10px] font-bold text-green-600 uppercase">Early Pay (1%)</div>
+                                    <div className="text-sm font-bold text-green-700 mt-0.5">{calc.discountTotal}</div>
+                                    <div className="text-[10px] text-green-600">By {calc.discountDate}</div>
+                                </div>
+                                <div className="text-center">
+                                    <div className="text-[10px] font-bold text-slate-400 uppercase">Standard Net</div>
+                                    <div className="text-sm font-bold text-slate-600 mt-0.5">{calc.netTotal}</div>
+                                    <div className="text-[10px] text-slate-400">By {calc.netDate}</div>
+                                </div>
+                            </div>
+
+                            {/* Form Grid */}
+                            <div className="grid grid-cols-2 gap-x-4 gap-y-4">
+                                <div className="col-span-2 pb-2 border-b border-slate-100 mb-2">
+                                    <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Invoice Details</h3>
+                                </div>
+
+                                <InputRow label="Invoice Number" value={data.invoiceNumber} onChange={v=>update('invoiceNumber',v)} required icon="hash" />
+                                <InputRow label="Invoice Date" value={data.date} onChange={v=>update('date',v)} width="half" icon="calendar" />
+                                <InputRow label="PO Number" value={data.poNumber} onChange={v=>update('poNumber',v)} width="half" icon="file-text" />
+                                
+                                <InputRow label="Order Date" value={data.orderDate} onChange={v=>update('orderDate',v)} width="half" icon="calendar-clock" />
+                                <InputRow label="Ship Date" value={data.shipDate} onChange={v=>update('shipDate',v)} width="half" icon="truck" />
+                                
+                                <InputRow label="Job Name" value={data.jobName} onChange={v=>update('jobName',v)} icon="briefcase" />
+                                <InputRow label="Total Balance" value={data.total} onChange={v=>update('total',v)} icon="dollar-sign" />
+                            </div>
+                        </div>
+
+                        {/* Sticky Action Footer */}
+                        <div className="p-4 border-t border-slate-100 bg-white">
+                            <button 
+                                onClick={handleDownloadAndMail}
+                                className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg shadow-lg shadow-blue-200 hover:shadow-xl transition-all flex items-center justify-center gap-3 group"
+                            >
+                                <div className="bg-blue-500/50 p-1.5 rounded"><Icon name="download" size={20} /></div>
+                                <div className="text-left">
+                                    <div className="text-sm font-bold leading-none">Download "{fileName}" & Email</div>
+                                    <div className="text-[10px] text-blue-200 mt-0.5">Drag file to email draft</div>
+                                </div>
+                                <Icon name="arrow-right" className="ml-auto opacity-50 group-hover:translate-x-1 transition-transform" />
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
+
+
